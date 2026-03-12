@@ -1,0 +1,966 @@
+#include "C:\Users\ibrah\Desktop\PhysicsSimulator\include\raylib.h"
+#include "C:\Users\ibrah\Desktop\PhysicsSimulator\include\rlgl.h"
+#define RAYGUI_IMPLEMENTATION
+#include "raylib.h"
+#include "raygui.h"
+
+/**
+ * Multi-Ball Bouncing Physics Simulator
+ * 
+ * Terminal-based physics simulation demonstrating:
+ * - Projectile motion
+ * - Collisions (wall/floor and between balls)
+ * - Energy conservation
+ * 
+ * Architecture Layers:
+ * - Input Layer: user interaction and data collection
+ * - Physics Layer: core simulation logic and physics calculations
+ * - Visual Layer: rendering and trail visualization  
+ * - Analysis Layer: energy calculations and data analysis
+ */
+
+#include <stdio.h>
+#include <math.h>
+
+
+
+
+// ============================================================================
+// CONSTANTS & GLOBAL VARIABLES
+// ============================================================================
+
+#define WIDTH           40      // Width of the simulation box
+#define HEIGHT          20      // Height of the simulation box
+float GRAVITY        = -9.8f;    // Acceleration due to gravity (m/s^2)
+#define TRAIL_LENGTH    200     // Number of trail positions to remember
+#define MAX_BALLS       5       // Maximum number of balls allowed
+
+int trail_x[MAX_BALLS][TRAIL_LENGTH]; // X-coordinates of trails per ball
+int trail_y[MAX_BALLS][TRAIL_LENGTH]; // Y-coordinates of trails per ball
+int trail_index[MAX_BALLS];           // Current index in circular buffer per ball
+
+int num_balls;                         // Total number of balls in simulation
+
+
+
+
+typedef enum {
+    CONFIGURATION,
+    RUNNING
+} SimulationState;
+
+void reset_trails_for_num(int n) {
+    for (int b = 0; b < n && b < MAX_BALLS; b++) {
+        for (int i = 0; i < TRAIL_LENGTH; i++) {
+            trail_x[b][i] = -1;
+            trail_y[b][i] = -1;
+        }
+        trail_index[b] = 0;
+    }
+}
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+typedef struct {
+    float x;            // Current X position
+    float y;            // Current Y position
+    float velocityx;    // Velocity in X direction (m/s)
+    float velocityy;    // Velocity in Y direction (m/s)
+    float mass;         // Mass of the ball (kg)
+    float forcex;       // Current force in X direction (N)
+    float forcey;       // Current force in Y direction (N)
+    float restitution;  // Coefficient of restitution (0-1)
+    float radius;       // How big the ball is
+} Ball;
+
+// ============================================================================
+// FUNCTION PROTOTYPES
+// ============================================================================
+
+// Input layer
+void input_speed_angle(Ball *b);
+void input_velocity_components(Ball *b);
+void get_user_inputs(Ball balls[]);
+
+// Physics layer
+void apply_gravity(Ball *b);
+void update(Ball *b, float dt);
+void check_collision(Ball *b);
+void check_ball_collisions(Ball balls[], int num_balls);
+void simulation_step(Ball balls[], int num_balls, float dt);
+
+// Visual layer
+void update_trail(Ball *b, int ball_index);
+void draw(Ball balls[], int num_balls);
+
+// Analysis layer
+float kinetic_energy(Ball *b);
+float potential_energy(Ball *b);
+float total_energy(Ball *b);
+
+// ============================================================================
+// INPUT LAYER
+// ============================================================================
+
+
+/**
+ * asks users for launch speed and angle for a single ball
+ * converts speed and angle into x and y velocity vector componens using trig:
+ *      velocityx = speed * cos(angle)
+ *      velocityy = speed * sin(angle)
+ * this allows the simulation to work with vector-based velocities
+ */
+void input_speed_angle(Ball *b) {
+    float speed, angle_deg;
+    printf("Enter launch speed (m/s): ");
+    scanf("%f", &speed);
+    printf("Enter launch angle (degrees): ");
+    scanf("%f", &angle_deg);
+
+    float angle_rad = angle_deg * M_PI / 180.0;
+    b->velocityx = speed * cos(angle_rad);
+    b->velocityy = speed * sin(angle_rad);
+
+    printf("Calculated vx = %.2f m/s\n", b->velocityx);
+    printf("Calculated vy = %.2f m/s\n", b->velocityy);
+}
+
+
+/**
+ * asks user to input velocity components directly:
+ * - velocityx: horizontal speed
+ * - velocityy: vertical speed
+ * allows users to skip the speed/angle step and directly define motion vector.
+ */
+void input_velocity_components(Ball *b) {
+    printf("Enter velocity x (m/s): ");
+    scanf("%f", &b->velocityx);
+
+    printf("Enter velocity y (m/s): ");
+    scanf("%f", &b->velocityy);
+}
+
+
+/**
+ * handles multi-ball input from the user
+ * - asks for number of balls (1 to MAX_BALLS)
+ * - iterates through each ball to get:
+ *   - initial velocity (speed/angle or components)
+ *   - mass
+ *   - coefficient of restitution
+ *   - radius
+ * - stores values into the balls[] array
+ * checks balls in vlaid range
+ */
+void get_user_inputs(Ball balls[]) {
+    printf("Enter number of balls (1-%d): ", MAX_BALLS);
+    scanf("%d", &num_balls);
+
+    if(num_balls < 1) num_balls = 1;
+
+    if(num_balls > MAX_BALLS) num_balls = MAX_BALLS;
+
+    for(int i = 0; i < num_balls; i++) {
+        printf("\n Ball %d \n", i + 1);
+        int choice;
+        printf("Choose input type:\n1) Speed and Angle (GCSE style)\n2) Velocity Components vx, vy (Vector form)\nEnter choice: ");
+        scanf("%d", &choice);
+        if(choice == 1) input_speed_angle(&balls[i]);
+        else if(choice == 2) input_velocity_components(&balls[i]);
+        else {
+            printf("Invalid choice. Defaulting to speed/angle.\n");
+            input_speed_angle(&balls[i]);
+        }
+
+        printf("Enter mass (kg): ");
+        scanf("%f", &balls[i].mass);
+
+        printf("Enter coefficient of restitution (0 - 1): ");
+        scanf("%f", &balls[i].restitution);
+
+        printf("Enter ball radius (meters): ");
+        scanf("%f", &balls[i].radius);
+
+        // Prevent excessively large balls
+        float max_radius = HEIGHT / 4.0f;
+
+        if(balls[i].radius > max_radius)
+        {
+            printf("Radius too large. Setting to maximum allowed: %.2f\n", max_radius);
+            balls[i].radius = max_radius;
+        }
+
+        if(balls[i].radius <= 0)
+        {
+            printf("Invalid radius. Defaulting to 0.5\n");
+            balls[i].radius = 0.5f;
+        }
+
+        // Set initial position of the ball in the centre of the simulation box
+        // if multiple balls then balls after have an offset
+        balls[i].x = WIDTH / 2.0f + i * 2.0f;
+        balls[i].y = HEIGHT / 2.0f;
+    }
+}
+
+// ============================================================================
+// PHYSICS LAYER
+// ============================================================================
+
+
+/**
+ * applies gravity to a ball
+ * - uses newtons 2nd law: F = ma
+ * - forcey is incremented by mass * GRAVITY
+ * - keeps force accumulation separate so multiple forces could be added if needed
+ */
+void apply_gravity(Ball *b) {
+    b->forcey += b->mass * GRAVITY;
+}
+
+
+/**
+ * updates ball position and velocity for the current frame
+ * - calcs acceleration: ax = forcex / mass, ay = forcey / mass
+ * - updates velocity using integration: v = v + a * dt
+ * - updates position: x = x + vx * dt, y = y + vy * dt
+ * - resets forces for the next frame
+ */
+void update(Ball *b, float dt) {
+    float ax = b->forcex / b->mass;
+    float ay = b->forcey / b->mass;
+    b->velocityx += ax * dt;
+    b->velocityy += ay * dt;
+    b->x += b->velocityx * dt;
+    b->y += b->velocityy * dt;
+    b->forcex = 0;
+    b->forcey = 0;
+}
+
+
+/**
+ * handles collisions with simulation boundaries for a single ball
+ * - left and right walls: reverses x velocity and scales by restitution
+ * - floor: reverses y velocity and scales by restitution; stops very small bounces to avoid jitter
+ * - ceiling: reverses y velocity (no energy loss applied)
+ * ensures balls stay within the box.
+ */
+void check_collision(Ball *b)
+{
+    // LEFT WALL
+    if(b->x <= b->radius)
+    {
+        b->x = b->radius;
+        b->velocityx = -b->velocityx * b->restitution;
+    }
+
+    // RIGHT WALL
+    if(b->x >= WIDTH - b->radius)
+    {
+        b->x = WIDTH - b->radius;
+        b->velocityx = -b->velocityx * b->restitution;
+    }
+
+    // FLOOR
+    if(b->y <= b->radius)
+    {
+        b->y = b->radius;
+        b->velocityy = -b->velocityy * b->restitution;
+
+        if(fabs(b->velocityy) < 0.1)
+            b->velocityy = 0;
+    }
+
+    // CEILING
+    if(b->y >= HEIGHT - b->radius)
+    {
+        b->y = HEIGHT - b->radius;
+        b->velocityy = -b->velocityy * b->restitution;
+    }
+}
+
+/**
+ * handles collisions between all balls using elastic collision aprox
+ * - iterates through all ball pairs
+ * - calcs distance between centers
+ * - if balls overlap (distance < min_dist):
+ *    - compute collision normal (nx, ny)
+ *    - calc relative velocity along normal
+ *    - apply momentum conservation formula to update velocities
+ *
+ * after velocity resolution, a position correction step is applied:
+ * - prevents balls from remaining overlapped after collision
+ * - pushes both balls apart along the collision normal
+ * - improves simulation stability and prevents repeated collision jitter
+ *
+ * assumes equal radius for all balls (radius = 0.5 units)
+ */
+void check_ball_collisions(Ball balls[], int num_balls) {
+
+    for(int i = 0; i < num_balls; i++) {
+        for(int j = i + 1; j < num_balls; j++) {
+            float dx = balls[j].x - balls[i].x;
+            float dy = balls[j].y - balls[i].y;
+            float distance = sqrt(dx*dx + dy*dy);
+            float min_dist = balls[i].radius + balls[j].radius;
+
+			if(distance < min_dist && distance != 0) {
+
+				float nx = dx / distance;
+				float ny = dy / distance;
+
+				// relative velocity along normal
+				float p = 2 * (balls[i].velocityx*nx + balls[i].velocityy*ny
+							- balls[j].velocityx*nx - balls[j].velocityy*ny) /
+						(balls[i].mass + balls[j].mass);
+
+				// update velocities
+				balls[i].velocityx -= p * balls[j].mass * nx;
+				balls[i].velocityy -= p * balls[j].mass * ny;
+				balls[j].velocityx += p * balls[i].mass * nx;
+				balls[j].velocityy += p * balls[i].mass * ny;
+
+				// position correction
+				float overlap = min_dist - distance;
+
+				balls[i].x -= nx * overlap * 0.5;
+				balls[i].y -= ny * overlap * 0.5;
+
+				balls[j].x += nx * overlap * 0.5;
+				balls[j].y += ny * overlap * 0.5;
+			}
+        }
+    }
+}
+
+
+/**
+ * executes one frame for all balls
+ * for each ball:
+ * 1) apply gravity
+ * 2) update velocity and position
+ * 3) check wall/floor/ceiling collisions
+ * 4) update visual trail
+ * finally, handle ball to ball collisions after all balls are updated
+ */
+void simulation_step(Ball balls[], int num_balls, float dt) {
+    for(int i = 0; i < num_balls; i++) {
+        apply_gravity(&balls[i]);
+        update(&balls[i], dt);
+        check_collision(&balls[i]);
+        update_trail(&balls[i], i);
+    }
+    check_ball_collisions(balls, num_balls);
+}
+
+// ============================================================================
+// VISUAL LAYER
+// ============================================================================
+
+
+/**
+ * records the balls position in a circular buffer for trail visualisation
+ * - stores (x, y) coordinates in trail_x and trail_y arrays per ball
+ * - increments trail_index, wraps around when reaching TRAIL_LENGTH
+ * - allows previous positions to be drawn as dots in the terminal for motion tracing
+ */
+void update_trail(Ball *b, int ball_index) {
+    trail_x[ball_index][trail_index[ball_index]] = (int)b->x;
+    trail_y[ball_index][trail_index[ball_index]] = (int)b->y;
+    trail_index[ball_index]++;
+    if(trail_index[ball_index] >= TRAIL_LENGTH) trail_index[ball_index] = 0;
+}
+
+
+/**
+ * renders simulation to terminal
+ * - clears the screen (Windows only)
+ * - iterates row by row, column by column:
+ *   - draw walls (|) at left/right edges
+ *   - draw floor (-) at y=0
+ *   - draw each ball as "O"
+ *   - draw trail positions as "." for past positions
+ * - allows multiple balls and their trails to be displayed simultaneously
+ */
+void draw(Ball balls[], int num_balls) {
+    for(int y = HEIGHT; y >= 0; y--) {
+        for(int x = 0; x <= WIDTH; x++) {
+            int drawn = 0;
+            for(int b = 0; b < num_balls; b++) {
+                if((int)balls[b].x == x && (int)balls[b].y == y) {
+                    printf("O"); drawn = 1; break;
+                }
+            }
+            if(drawn) continue;
+            if(y == 0) printf("-");
+            else if(x == 0 || x == WIDTH) printf("|");
+            else {
+                int trail_here = 0;
+                for(int b = 0; b < num_balls; b++) {
+                    for(int i = 0; i < TRAIL_LENGTH; i++) {
+                        if(trail_x[b][i] == x && trail_y[b][i] == y) { printf("."); trail_here = 1; break; }
+                    }
+                    if(trail_here) break;
+                }
+                if(!trail_here) printf(" ");
+            }
+        }
+        printf("\n");
+    }
+}
+
+// ============================================================================
+// ANALYSIS LAYER
+// ============================================================================
+
+
+/**
+ * calcs kinetic energy of a single ball
+ * KE = 0.5 * mass * (vx^2 + vy^2)
+ */
+float kinetic_energy(Ball *b) { return 0.5 * b->mass * (b->velocityx*b->velocityx + b->velocityy*b->velocityy); }
+
+
+/**
+ * calcs gravitational potential energy of a single ball
+ * PE = mass * g * height
+ */
+float potential_energy(Ball *b) { return b->mass * 9.8 * b->y; }
+
+
+/**
+ * returns total mechanical energy of a single ball
+ * TE = KE + PE
+ * useful for checking energy conservation in the simulation
+ */
+float total_energy(Ball *b) { return kinetic_energy(b) + potential_energy(b); }
+
+// ============================================================================
+// MAIN PROGRAM
+// ============================================================================
+
+/**
+ * main entry point of the multi-ball physics simulator
+ *
+ * responsibilities of this function:
+ * 1) initialise ball objects
+ * 2) collect all user inputs (number of balls, velocities, mass, restitution)
+ * 3) config simulation timing parameters
+ * 4) run the main simulation loop
+ * 5) compute and display system energy values
+ *
+ * simulation loop process per frame:
+ * - update physics for all balls (gravity, movement, collisions)
+ * - redraw the terminal scene
+ * - calc total kinetic and potential energy
+ * - pause briefly so animation is visible
+ *
+ * the simulation runs until the specified total simulation time is reached.
+ */
+
+
+    
+
+
+#define SCALE 30
+
+#define SCREEN_WIDTH  (WIDTH * SCALE)
+#define SCREEN_HEIGHT (HEIGHT * SCALE)
+
+
+
+// Raylib Visual Layer (NEW)
+void init_raylib();
+void draw_raylib(Ball balls[], int num_balls);
+void close_raylib();
+void run_raylib_simulation(Ball balls[], float dt, int max_frames);
+
+
+void init_raylib()
+{
+    InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Physics Simulator - Raylib");
+    SetTargetFPS(60);
+}
+
+void draw_raylib(Ball balls[], int num_balls)
+{
+    BeginDrawing();
+
+    ClearBackground(BLACK);
+
+    // Draw floor
+    DrawLine(0, SCREEN_HEIGHT, SCREEN_WIDTH, SCREEN_HEIGHT, WHITE);
+
+    // Draw walls
+    DrawLine(0, 0, 0, SCREEN_HEIGHT, WHITE);
+    DrawLine(SCREEN_WIDTH, 0, SCREEN_WIDTH, SCREEN_HEIGHT, WHITE);
+
+    // Draw trails
+    for(int b = 0; b < num_balls; b++)
+    {
+        for(int i = 0; i < TRAIL_LENGTH; i++)
+        {
+            int px = trail_x[b][i] * SCALE;
+            int py = SCREEN_HEIGHT - trail_y[b][i] * SCALE;
+
+            DrawCircle(px, py, 2, GRAY);
+        }
+    }
+
+    // Draw balls
+    for(int i = 0; i < num_balls; i++)
+    {
+        int px = balls[i].x * SCALE;
+        int py = SCREEN_HEIGHT - balls[i].y * SCALE;
+
+        DrawCircle(px, py, 8, RED);
+    }
+
+    EndDrawing();
+}
+
+
+void close_raylib()
+{
+    CloseWindow();
+}
+
+
+
+
+
+void run_raylib_simulation(Ball initialBalls[], float dt, int max_frames)
+{
+    SimulationState simState = CONFIGURATION;
+    bool paused = false;
+    bool show_vectors = true;
+    bool slow_motion = false;
+    const float slow_factor = 0.2f;
+
+    const int screenWidth = 1024;
+    const int screenHeight = 720;
+    const int panelWidth = 320;
+    const int simWidth = screenWidth - panelWidth;
+
+    Ball guiBalls[MAX_BALLS];
+    Ball simBalls[MAX_BALLS];
+    Ball savedInitialBalls[MAX_BALLS];
+
+    float gui_speed[MAX_BALLS];
+    float gui_angle_deg[MAX_BALLS];
+    bool gui_use_speedangle[MAX_BALLS];
+
+    // Ball count persistent integer (controls GUI)
+    int guiBallCount = (num_balls > 0) ? num_balls : 1;
+
+    // Run mode controls (timed or continuous)
+    bool guiTimedRun = false;
+    float guiRunDuration = 10.0f; // seconds
+    float simElapsed = 0.0f;
+
+    // Copy initialBalls into guiBalls (or apply defaults)
+    for (int i = 0; i < MAX_BALLS; i++) {
+        if (initialBalls != NULL && i < num_balls && initialBalls[i].radius > 0) {
+            guiBalls[i] = initialBalls[i];
+            simBalls[i] = initialBalls[i];
+            savedInitialBalls[i] = initialBalls[i];
+        } else {
+            guiBalls[i].x = WIDTH/2.0f + i*2.0f;
+            guiBalls[i].y = HEIGHT/2.0f;
+            guiBalls[i].mass = 1.0f;
+            guiBalls[i].restitution = 0.8f;
+            guiBalls[i].radius = 0.5f;
+            guiBalls[i].velocityx = 0.0f;
+            guiBalls[i].velocityy = 0.0f;
+            simBalls[i] = guiBalls[i];
+            savedInitialBalls[i] = guiBalls[i];
+        }
+        gui_use_speedangle[i] = true;
+        gui_speed[i] = sqrtf(guiBalls[i].velocityx*guiBalls[i].velocityx + guiBalls[i].velocityy*guiBalls[i].velocityy);
+        gui_angle_deg[i] = atan2f(guiBalls[i].velocityy, guiBalls[i].velocityx) * 180.0f / M_PI;
+    }
+
+    float guiGravity = GRAVITY;
+    reset_trails_for_num(guiBallCount);
+
+    InitWindow(screenWidth, screenHeight, "Multi-Ball Physics Simulator");
+    SetTargetFPS(60);
+
+    float scaleX = (float)simWidth / (float)WIDTH;
+    float scaleY = (float)screenHeight / (float)HEIGHT;
+
+    int frame = 0;
+    while (!WindowShouldClose() && (max_frames <= 0 || frame < max_frames))
+    {
+        // Keyboard toggles
+        if (IsKeyPressed(KEY_V)) show_vectors = !show_vectors;
+        if (IsKeyPressed(KEY_S)) slow_motion = !slow_motion;
+        if (IsKeyPressed(KEY_SPACE) && simState == RUNNING) paused = !paused;
+
+        // Physics updates when running
+        if (simState == RUNNING && !paused)
+        {
+            float effective_dt = dt;
+            if (slow_motion) effective_dt *= slow_factor;
+
+            int substeps = 4;
+            float sub_dt = effective_dt / (float)substeps;
+
+            for (int s = 0; s < substeps; s++) simulation_step(simBalls, guiBallCount, sub_dt);
+
+            // if timed mode, increment elapsed and auto-stop when reached
+            if (guiTimedRun) {
+                simElapsed += dt;
+                if (simElapsed >= guiRunDuration) {
+                    // Stop and return to configuration
+                    simState = CONFIGURATION;
+                    paused = false;
+                    // restore GUI to saved initial state (keeps instructor's saved config)
+                    for (int i = 0; i < guiBallCount; i++) {
+                        guiBalls[i] = savedInitialBalls[i];
+                        gui_speed[i] = sqrtf(guiBalls[i].velocityx*guiBalls[i].velocityx + guiBalls[i].velocityy*guiBalls[i].velocityy);
+                        gui_angle_deg[i] = atan2f(guiBalls[i].velocityy, guiBalls[i].velocityx) * 180.0f / M_PI;
+                        gui_use_speedangle[i] = true;
+                        simBalls[i] = guiBalls[i];
+                    }
+                    reset_trails_for_num(guiBallCount);
+                    simElapsed = 0.0f;
+                }
+            }
+        }
+
+        // Drawing
+        BeginDrawing();
+        ClearBackground(RAYWHITE);
+
+        // Simulation area
+        DrawRectangle(0, 0, simWidth, screenHeight, LIGHTGRAY);
+        DrawLine(0, screenHeight, simWidth, screenHeight, BLACK);
+        DrawLine(0, 0, 0, screenHeight, BLACK);
+        DrawLine(simWidth - 1, 0, simWidth - 1, screenHeight, BLACK);
+
+        // Trails (draw simBalls trails)
+        for (int b = 0; b < guiBallCount; b++) {
+            for (int t = 0; t < TRAIL_LENGTH; t++) {
+                if (trail_x[b][t] < 0) continue;
+                int px_t = (int)(trail_x[b][t] * scaleX);
+                int py_t = (int)(screenHeight - trail_y[b][t] * scaleY);
+                if (px_t >= 0 && px_t < simWidth && py_t >= 0 && py_t < screenHeight) DrawCircle(px_t, py_t, 2.0f, GRAY);
+            }
+        }
+
+        Ball *drawBalls = (simState == RUNNING) ? simBalls : guiBalls;
+        for (int i = 0; i < guiBallCount; i++) {
+            float x = drawBalls[i].x * scaleX;
+            float y = screenHeight - drawBalls[i].y * scaleY;
+            float radius_pixels = drawBalls[i].radius * ((scaleX + scaleY) * 0.5f);
+            DrawCircle((int)x, (int)y, radius_pixels, RED);
+
+            if (show_vectors) {
+                float velocity_scale = 5.0f;
+                float vx = drawBalls[i].velocityx * velocity_scale;
+                float vy = -drawBalls[i].velocityy * velocity_scale;
+                DrawLine((int)x, (int)y, (int)(x + vx), (int)(y + vy), BLUE);
+
+                float accel_scale = 2.0f;
+                float ax = 0;
+                float ay = guiGravity * accel_scale;
+                DrawLine((int)x, (int)y, (int)(x + ax), (int)(y - ay), GREEN);
+            }
+        }
+
+        // Right-hand panel
+        int px = simWidth;
+        DrawRectangle(px, 0, panelWidth, screenHeight, Fade(SKYBLUE, 0.12f));
+        DrawRectangleLines(px, 0, panelWidth, screenHeight, GRAY);
+        DrawText("Controls", px + 12, 8, 20, DARKGRAY);
+
+        int y = 36;
+        int btnW = panelWidth - 24;
+        int btnH = 28;
+
+        // ---------- Ball count: buttons instead of slider ----------
+        DrawText("Ball count", px + 12, y, 12, DARKGRAY);
+        y += 18;
+        if (simState == CONFIGURATION) {
+            // minus button
+            if (GuiButton((Rectangle){px + 12, (float)y, 40, 24}, "-") && guiBallCount > 1) {
+                guiBallCount--;
+                reset_trails_for_num(guiBallCount);
+            }
+            // plus button
+            if (GuiButton((Rectangle){px + 12 + 48, (float)y, 40, 24}, "+") && guiBallCount < MAX_BALLS) {
+                int k = guiBallCount;
+                // initialize new ball defaults
+                guiBalls[k].x = WIDTH/2.0f + k*2.0f;
+                guiBalls[k].y = HEIGHT/2.0f;
+                guiBalls[k].mass = 1.0f;
+                guiBalls[k].restitution = 0.8f;
+                guiBalls[k].radius = 0.5f;
+                guiBalls[k].velocityx = 0.0f;
+                guiBalls[k].velocityy = 0.0f;
+                gui_speed[k] = 0.0f;
+                gui_angle_deg[k] = 0.0f;
+                gui_use_speedangle[k] = true;
+                savedInitialBalls[k] = guiBalls[k];
+                guiBallCount++;
+                reset_trails_for_num(guiBallCount);
+            }
+            // display number
+            char bcbuf[16];
+            sprintf(bcbuf, "%d", guiBallCount);
+            DrawText(bcbuf, px + 12 + 100, y + 2, 20, DARKGRAY);
+            num_balls = guiBallCount;
+        } else {
+            // when running, show read-only ball count
+            char bcbuf[32];
+            sprintf(bcbuf, "Balls: %d", guiBallCount);
+            DrawText(bcbuf, px + 12, y + 2, 14, DARKGRAY);
+        }
+        y += 34;
+
+        // Control buttons (Start / Pause / Reset)
+        Rectangle rStart = (Rectangle){px + 12, (float)y, (float)btnW, (float)btnH};
+        y += btnH + 8;
+        Rectangle rPause = (Rectangle){px + 12, (float)y, (float)btnW, (float)btnH};
+        y += btnH + 8;
+        Rectangle rReset = (Rectangle){px + 12, (float)y, (float)btnW, (float)btnH};
+        y += btnH + 12;
+
+        if (simState == CONFIGURATION) {
+            if (GuiButton(rStart, "Start")) {
+                // commit GUI -> simBalls (convert speed/angle to vx/vy)
+                for (int i = 0; i < guiBallCount; i++) {
+                    if (gui_use_speedangle[i]) {
+                        float a_rad = gui_angle_deg[i] * M_PI / 180.0f;
+                        guiBalls[i].velocityx = gui_speed[i] * cosf(a_rad);
+                        guiBalls[i].velocityy = gui_speed[i] * sinf(a_rad);
+                    }
+                    simBalls[i] = guiBalls[i];
+                }
+                GRAVITY = guiGravity;
+                simElapsed = 0.0f;
+                reset_trails_for_num(guiBallCount);
+                for (int b = 0; b < guiBallCount; b++) update_trail(&simBalls[b], b);
+                simState = RUNNING;
+                paused = false;
+            }
+
+            GuiSetState(STATE_DISABLED);
+            GuiButton(rPause, "Pause (start first)");
+            GuiSetState(STATE_NORMAL);
+
+            if (GuiButton(rReset, "Reset to Saved")) {
+                for (int i = 0; i < guiBallCount; i++) {
+                    guiBalls[i] = savedInitialBalls[i];
+                    gui_speed[i] = sqrtf(guiBalls[i].velocityx*guiBalls[i].velocityx + guiBalls[i].velocityy*guiBalls[i].velocityy);
+                    gui_angle_deg[i] = atan2f(guiBalls[i].velocityy, guiBalls[i].velocityx) * 180.0f / M_PI;
+                    gui_use_speedangle[i] = true;
+                }
+                guiGravity = GRAVITY;
+                reset_trails_for_num(guiBallCount);
+            }
+        } else { // RUNNING
+            GuiSetState(STATE_DISABLED);
+            GuiButton(rStart, "Running...");
+            GuiSetState(STATE_NORMAL);
+
+            if (GuiButton(rPause, paused ? "Resume (Space)" : "Pause (Space)")) paused = !paused;
+
+            if (GuiButton(rReset, "Stop & Edit")) {
+                simState = CONFIGURATION;
+                paused = false;
+                // restore GUI to saved initial state
+                for (int i = 0; i < guiBallCount; i++) {
+                    guiBalls[i] = savedInitialBalls[i];
+                    gui_speed[i] = sqrtf(guiBalls[i].velocityx*guiBalls[i].velocityx + guiBalls[i].velocityy*guiBalls[i].velocityy);
+                    gui_angle_deg[i] = atan2f(guiBalls[i].velocityy, guiBalls[i].velocityx) * 180.0f / M_PI;
+                    gui_use_speedangle[i] = true;
+                    simBalls[i] = guiBalls[i];
+                }
+                reset_trails_for_num(guiBallCount);
+                simElapsed = 0.0f;
+            }
+        }
+
+        DrawText("Space = Pause/Resume (when running)", px + 12, screenHeight - 56, 10, DARKGRAY);
+
+        // Global (gravity) control
+        y += 6;
+        DrawText("Global", px + 12, y, 14, DARKGRAY);
+        y += 18;
+        if (simState == CONFIGURATION) {
+            GuiLabel((Rectangle){px+12, y, 60, 20}, "Gravity");
+            GuiSlider((Rectangle){px + 12 + 60, y, panelWidth - 12 - 60 - 12, 20}, NULL, NULL, &guiGravity, -20.0f, 0.0f);
+        } else {
+            char gbuf[64];
+            sprintf(gbuf, "Gravity: %.2f", GRAVITY);
+            DrawText(gbuf, px + 12, y, 14, DARKGRAY);
+        }
+        y += 32;
+
+        // Timed run controls (only in CONFIGURATION)
+        DrawText("Run Mode", px + 12, y, 14, DARKGRAY);
+        y += 18;
+        if (simState == CONFIGURATION) {
+            GuiLabel((Rectangle){px+12, y, 120, 20}, "Timed run?");
+            GuiCheckBox((Rectangle){px + 12 + 120, y, 20, 20}, NULL, &guiTimedRun);
+            y += 26;
+            if (guiTimedRun) {
+                DrawText("Duration (s)", px + 12, y, 12, DARKGRAY);
+                GuiSlider((Rectangle){px + 12, y + 14, panelWidth - 24, 18}, NULL, NULL, &guiRunDuration, 0.5f, 600.0f);
+                y += 36;
+            } else {
+                DrawText("Duration: n/a (continuous)", px + 12, y, 12, DARKGRAY);
+                y += 26;
+            }
+        } else {
+            char tbuf[64];
+            if (guiTimedRun) sprintf(tbuf, "Timed: %.1f s (running %.1f s)", guiRunDuration, simElapsed);
+            else sprintf(tbuf, "Continuous run");
+            DrawText(tbuf, px + 12, y, 12, DARKGRAY);
+            y += 26;
+        }
+
+        // Per-ball controls (unchanged logic, still unique per ball)
+        for (int i = 0; i < guiBallCount; i++) {
+            char title[32];
+            sprintf(title, "Ball %d", i+1);
+            DrawText(title, px + 12, y, 14, DARKGRAY);
+            y += 18;
+
+            if (simState == CONFIGURATION) {
+                char mlabel[64];
+                sprintf(mlabel, "Mass %.2f kg", guiBalls[i].mass);
+                DrawText(mlabel, px + 12, y, 12, DARKGRAY);
+                GuiSlider((Rectangle){px + 12, y + 14, panelWidth - 24, 18}, NULL, NULL, &guiBalls[i].mass, 0.1f, 500.0f);
+                y += 38;
+
+                char rlabel[64];
+                sprintf(rlabel, "Restitution %.2f", guiBalls[i].restitution);
+                DrawText(rlabel, px + 12, y, 12, DARKGRAY);
+                GuiSlider((Rectangle){px + 12, y + 14, panelWidth - 24, 18}, NULL, NULL, &guiBalls[i].restitution, 0.0f, 1.0f);
+                y += 38;
+
+                char radlabel[64];
+                sprintf(radlabel, "Radius %.2f", guiBalls[i].radius);
+                DrawText(radlabel, px + 12, y, 12, DARKGRAY);
+                GuiSlider((Rectangle){px + 12, y + 14, panelWidth - 24, 18}, NULL, NULL, &guiBalls[i].radius, 0.05f, 5.0f);
+                y += 38;
+
+                // Velocity mode checkbox (speed+angle or vx/vy)
+                GuiCheckBox((Rectangle){px+12, y, 20, 20}, NULL, &gui_use_speedangle[i]);
+                DrawText(gui_use_speedangle[i] ? "Speed & Angle" : "Vx & Vy", px + 36, y, 12, DARKGRAY);
+                y += 24;
+
+                if (gui_use_speedangle[i]) {
+                    char sLabel[64];
+                    sprintf(sLabel, "Speed %.2f", gui_speed[i]);
+                    DrawText(sLabel, px + 12, y, 12, DARKGRAY);
+                    GuiSlider((Rectangle){px + 12, y + 14, panelWidth - 24, 18}, NULL, NULL, &gui_speed[i], 0.0f, 200.0f);
+                    y += 38;
+
+                    char aLabel[64];
+                    sprintf(aLabel, "Angle %.1f deg", gui_angle_deg[i]);
+                    DrawText(aLabel, px + 12, y, 12, DARKGRAY);
+                    GuiSlider((Rectangle){px + 12, y + 14, panelWidth - 24, 18}, NULL, NULL, &gui_angle_deg[i], -180.0f, 180.0f);
+                    y += 38;
+
+                    float a_rad = gui_angle_deg[i] * M_PI / 180.0f;
+                    guiBalls[i].velocityx = gui_speed[i] * cosf(a_rad);
+                    guiBalls[i].velocityy = gui_speed[i] * sinf(a_rad);
+
+                } else {
+                    char vxLabel[64], vyLabel[64];
+                    sprintf(vxLabel, "vx %.2f", guiBalls[i].velocityx);
+                    sprintf(vyLabel, "vy %.2f", guiBalls[i].velocityy);
+                    DrawText(vxLabel, px + 12, y, 12, DARKGRAY);
+                    GuiSlider((Rectangle){px + 12, y + 14, panelWidth - 24, 18}, NULL, NULL, &guiBalls[i].velocityx, -200.0f, 200.0f);
+                    y += 38;
+                    DrawText(vyLabel, px + 12, y, 12, DARKGRAY);
+                    GuiSlider((Rectangle){px + 12, y + 14, panelWidth - 24, 18}, NULL, NULL, &guiBalls[i].velocityy, -200.0f, 200.0f);
+                    y += 38;
+
+                    gui_speed[i] = sqrtf(guiBalls[i].velocityx*guiBalls[i].velocityx + guiBalls[i].velocityy*guiBalls[i].velocityy);
+                    gui_angle_deg[i] = atan2f(guiBalls[i].velocityy, guiBalls[i].velocityx) * 180.0f / M_PI;
+                }
+
+            } else {
+                char buf[128];
+                sprintf(buf, "Mass: %.2f  Rest: %.2f  R: %.2f", simBalls[i].mass, simBalls[i].restitution, simBalls[i].radius);
+                DrawText(buf, px + 12, y, 12, DARKGRAY);
+                y += 18;
+                sprintf(buf, "vx: %.2f  vy: %.2f", simBalls[i].velocityx, simBalls[i].velocityy);
+                DrawText(buf, px + 12, y, 12, DARKGRAY);
+                y += 22;
+            }
+
+            y += 6;
+            if (y > screenHeight - 120) {
+                DrawText("...more controls off-screen", px + 12, screenHeight - 100, 10, DARKGRAY);
+                break;
+            }
+        } // per-ball loop
+
+        // Energy display
+        float total_ke = 0.0f, total_pe = 0.0f;
+        Ball *energyBalls = (simState == RUNNING) ? simBalls : guiBalls;
+        for (int i = 0; i < guiBallCount; i++) {
+            total_ke += kinetic_energy(&energyBalls[i]);
+            total_pe += potential_energy(&energyBalls[i]);
+        }
+        char energyBuf[128];
+        sprintf(energyBuf, "KE: %.2f J   PE: %.2f J   Total: %.2f J", total_ke, total_pe, total_ke + total_pe);
+        DrawText(energyBuf, px + 12, screenHeight - 30, 12, DARKGRAY);
+
+        EndDrawing();
+
+        // add trail sample while running
+        if (simState == RUNNING && !paused) {
+            for (int b = 0; b < guiBallCount; b++) update_trail(&simBalls[b], b);
+        }
+
+        frame++;
+    } // while
+
+    CloseWindow();
+}
+
+/*
+int main()
+{
+    Ball balls[MAX_BALLS] = {0};
+
+    // Input phase
+    get_user_inputs(balls);
+
+    float dt = 1.0f / 60.0f;
+    float total_time;
+
+    printf("Enter total simulation time (seconds): ");
+    scanf("%f", &total_time);
+
+    int max_frames = (int)(total_time / dt);
+
+    // Run the Raylib simulation
+    run_raylib_simulation(balls, dt, max_frames);
+
+    return 0;
+}
+*/
+
+int main()
+{
+    Ball balls[MAX_BALLS] = {0};
+    // start with one ball by default; GUI will let user add more
+    num_balls = 1;
+
+    float dt = 1.0f / 60.0f;
+
+    // pass max_frames = 0 to run until window closed
+    run_raylib_simulation(balls, dt, 0);
+
+    return 0;
+}
