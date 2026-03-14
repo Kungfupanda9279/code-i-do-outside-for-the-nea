@@ -1,0 +1,1015 @@
+
+#include <math.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+#define WIDTH        40     // Width of the simulation box (metres)
+#define HEIGHT       20     // Height of the simulation box (metres)
+#define TRAIL_LENGTH 200    // Number of trail positions stored per ball
+#define MAX_BALLS    5      // Maximum number of balls in the simulation
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+extern float GRAVITY;                           // Acceleration due to gravity (m/s^2), negative = downward
+extern int   trail_x[MAX_BALLS][TRAIL_LENGTH];  // X-coordinates of trail positions per ball
+extern int   trail_y[MAX_BALLS][TRAIL_LENGTH];  // Y-coordinates of trail positions per ball
+extern int   trail_index[MAX_BALLS];            // Current write index in the circular trail buffer
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+/**
+ * Represents a single ball in the simulation.
+ * Positions and velocities are in metres and metres/second.
+ * Forces accumulate each frame and are reset after integration.
+ */
+typedef struct {
+    float x;           // Current X position (m)
+    float y;           // Current Y position (m)
+    float velocityx;   // Velocity in X direction (m/s)
+    float velocityy;   // Velocity in Y direction (m/s)
+    float mass;        // Mass (kg)
+    float forcex;      // Accumulated force in X direction (N) — reset each frame
+    float forcey;      // Accumulated force in Y direction (N) — reset each frame
+    float restitution; // Coefficient of restitution (0 = no bounce, 1 = perfect bounce)
+    float radius;      // Radius of the ball (m)
+} Ball;
+
+// ============================================================================
+// FUNCTION PROTOTYPES
+// ============================================================================
+
+// Trail
+void reset_trails_for_num(int n);
+void update_trail(Ball *b, int ball_index);
+
+// Physics
+void apply_gravity(Ball *b);
+void update_ball(Ball *b, float dt);
+void check_wall_collisions(Ball *b);
+void check_ball_collisions(Ball balls[], int num_balls);
+void simulation_step(Ball balls[], int num_balls, float dt);
+
+// Analysis
+float kinetic_energy(Ball *b);
+float potential_energy(Ball *b);
+float total_energy(Ball *b);
+
+// ============================================================================
+// GLOBAL STATE DEFINITIONS
+// ============================================================================
+
+float GRAVITY = -9.8f;
+
+int trail_x[MAX_BALLS][TRAIL_LENGTH];
+int trail_y[MAX_BALLS][TRAIL_LENGTH];
+int trail_index[MAX_BALLS];
+
+// ============================================================================
+// TRAIL
+// ============================================================================
+
+/**
+ * Resets trail buffers for the first n balls.
+ * All positions are set to -1 (invalid) and write indices reset to 0.
+ * Call this whenever the ball count changes or a simulation restarts.
+ */
+void reset_trails_for_num(int n) {
+    for (int b = 0; b < n; b++) {
+        for (int i = 0; i < TRAIL_LENGTH; i++) {
+            trail_x[b][i] = -1;
+            trail_y[b][i] = -1;
+        }
+        trail_index[b] = 0;
+    }
+}
+
+/**
+ * Records the ball's current position into its circular trail buffer.
+ * The write index wraps around once it reaches TRAIL_LENGTH,
+ * overwriting the oldest position.
+ */
+void update_trail(Ball *b, int ball_index) {
+    trail_x[ball_index][trail_index[ball_index]] = (int)b->x;
+    trail_y[ball_index][trail_index[ball_index]] = (int)b->y;
+    trail_index[ball_index]++;
+    if (trail_index[ball_index] >= TRAIL_LENGTH)
+        trail_index[ball_index] = 0;
+}
+
+// ============================================================================
+// PHYSICS
+// ============================================================================
+
+/**
+ * Accumulates gravitational force onto a ball using Newton's second law:
+ *     F = m * g
+ * Forces are kept separate so additional forces (e.g. drag, wind)
+ * can be added each frame before integration.
+ */
+void apply_gravity(Ball *b) {
+    b->forcey += b->mass * GRAVITY;
+}
+
+/**
+ * Integrates forces into velocity and position using Euler integration:
+ *     a  = F / m
+ *     v += a * dt
+ *     x += v * dt
+ * Forces are reset to zero after integration ready for the next frame.
+ */
+void update_ball(Ball *b, float dt) {
+    float ax = b->forcex / b->mass;
+    float ay = b->forcey / b->mass;
+
+    b->velocityx += ax * dt;
+    b->velocityy += ay * dt;
+    b->x         += b->velocityx * dt;
+    b->y         += b->velocityy * dt;
+
+    b->forcex = 0;
+    b->forcey = 0;
+}
+
+/**
+ * Resolves collisions between a ball and the four simulation boundaries.
+ *
+ * Left / right walls and floor:
+ *   - Position is clamped to keep the ball inside.
+ *   - Velocity component is reversed and scaled by restitution.
+ *   - On the floor, very small vertical velocities are zeroed to
+ *     prevent infinite low-energy jitter.
+ *
+ * Ceiling:
+ *   - Same as walls — restitution applied for consistency.
+ */
+void check_wall_collisions(Ball *b) {
+    // LEFT WALL
+    if (b->x <= b->radius) {
+        b->x        = b->radius;
+        b->velocityx = -b->velocityx * b->restitution;
+    }
+
+    // RIGHT WALL
+    if (b->x >= WIDTH - b->radius) {
+        b->x        = WIDTH - b->radius;
+        b->velocityx = -b->velocityx * b->restitution;
+    }
+
+    // FLOOR
+    if (b->y <= b->radius) {
+        b->y        = b->radius;
+        b->velocityy = -b->velocityy * b->restitution;
+
+        if (fabs(b->velocityy) < 0.1f)
+            b->velocityy = 0;
+    }
+
+    // CEILING
+    if (b->y >= HEIGHT - b->radius) {
+        b->y        = HEIGHT - b->radius;
+        b->velocityy = -b->velocityy * b->restitution;
+    }
+}
+
+/**
+ * Resolves collisions between every pair of balls.
+ *
+ * For each overlapping pair:
+ *   1. Compute the collision normal from centre-to-centre direction.
+ *   2. Calculate the relative velocity along that normal.
+ *   3. Apply the impulse formula derived from conservation of momentum:
+ *          p = 2 * dot(v_rel, n) / (m_i + m_j)
+ *      and update both velocities.
+ *   4. Apply a position correction to push the balls apart by the overlap
+ *      amount, preventing them from tunnelling into each other over
+ *      multiple frames.
+ */
+void check_ball_collisions(Ball balls[], int num_balls) {
+    for (int i = 0; i < num_balls; i++) {
+        for (int j = i + 1; j < num_balls; j++) {
+            float dx       = balls[j].x - balls[i].x;
+            float dy       = balls[j].y - balls[i].y;
+            float distance = sqrtf(dx*dx + dy*dy);
+            float min_dist = balls[i].radius + balls[j].radius;
+
+            if (distance >= min_dist || distance == 0) continue;
+
+            float nx = dx / distance;
+            float ny = dy / distance;
+
+            // Impulse scalar from momentum conservation
+            float p = 2.0f * (balls[i].velocityx*nx + balls[i].velocityy*ny
+                            - balls[j].velocityx*nx - balls[j].velocityy*ny)
+                    / (balls[i].mass + balls[j].mass);
+
+            balls[i].velocityx -= p * balls[j].mass * nx;
+            balls[i].velocityy -= p * balls[j].mass * ny;
+            balls[j].velocityx += p * balls[i].mass * nx;
+            balls[j].velocityy += p * balls[i].mass * ny;
+
+            // Position correction — push balls apart by half the overlap each
+            float overlap = min_dist - distance;
+            balls[i].x   -= nx * overlap * 0.5f;
+            balls[i].y   -= ny * overlap * 0.5f;
+            balls[j].x   += nx * overlap * 0.5f;
+            balls[j].y   += ny * overlap * 0.5f;
+        }
+    }
+}
+
+/**
+ * Advances the simulation by one timestep for all balls:
+ *   1. Apply gravity to accumulate force.
+ *   2. Integrate forces into velocity and position.
+ *   3. Resolve wall and ceiling collisions.
+ * Then, once all balls are updated, resolve ball-to-ball collisions
+ * and record trail positions with the final post-collision positions.
+ */
+void simulation_step(Ball balls[], int num_balls, float dt) {
+    for (int i = 0; i < num_balls; i++) {
+        apply_gravity(&balls[i]);
+        update_ball(&balls[i], dt);
+        check_wall_collisions(&balls[i]);
+    }
+
+    check_ball_collisions(balls, num_balls);
+
+    // Trail update happens after all physics so positions are fully resolved
+    for (int i = 0; i < num_balls; i++)
+        update_trail(&balls[i], i);
+}
+
+// ============================================================================
+// ANALYSIS
+// ============================================================================
+
+/**
+ * Returns the kinetic energy of a ball:
+ *     KE = 0.5 * m * (vx^2 + vy^2)
+ */
+float kinetic_energy(Ball *b) {
+    return 0.5f * b->mass * (b->velocityx*b->velocityx + b->velocityy*b->velocityy);
+}
+
+/**
+ * Returns the gravitational potential energy of a ball:
+ *     PE = m * |g| * y
+ * Uses fabs(GRAVITY) so PE is always positive regardless of GRAVITY's sign.
+ */
+float potential_energy(Ball *b) {
+    return b->mass * fabsf(GRAVITY) * b->y;
+}
+
+/**
+ * Returns the total mechanical energy of a ball:
+ *     TE = KE + PE
+ * Useful for verifying energy conservation — total should decrease
+ * slowly due to restitution losses and stay stable between bounces.
+ */
+float total_energy(Ball *b) {
+    return kinetic_energy(b) + potential_energy(b);
+}
+
+
+
+
+#define RAYGUI_IMPLEMENTATION
+#include "raylib.h"
+#include "raygui.h"
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+#define BALL_PANEL_HEIGHT_PER_BALL 220.0f  // Estimated pixel height per ball in the scroll panel
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+typedef enum {
+    CONFIGURATION,  // User is setting up the simulation
+    RUNNING         // Simulation is actively playing
+} SimulationState;
+
+/**
+ * Holds all GUI and simulation state for the running session.
+ * Separating this into a struct avoids global variables and makes
+ * it easy to reset or inspect the full simulation state at once.
+ */
+typedef struct {
+    SimulationState simState;
+
+    bool  paused;        // Whether the simulation is currently paused
+    bool  show_vectors;  // Whether velocity and acceleration vectors are drawn
+    bool  slow_motion;   // Whether slow-motion mode is active
+    float slow_factor;   // Speed multiplier applied in slow-motion mode
+
+    Ball guiBalls[MAX_BALLS];          // Ball parameters as set in the GUI
+    Ball simBalls[MAX_BALLS];          // Ball state during active simulation
+    Ball savedInitialBalls[MAX_BALLS]; // Snapshot of initial state for reset
+
+    float gui_speed[MAX_BALLS];      // Speed values for speed/angle input mode
+    float gui_angle_deg[MAX_BALLS];  // Angle values for speed/angle input mode
+    bool  gui_use_speedangle[MAX_BALLS]; // Whether to use speed/angle or vx/vy
+
+    int   guiBallCount;   // Number of balls currently configured
+    float guiGravity;     // Gravity value set in the GUI
+
+    bool  guiTimedRun;      // Whether the simulation stops after a fixed time
+    float guiRunDuration;   // Duration for timed runs (seconds)
+    float simElapsed;       // Time elapsed in the current simulation run
+
+    float guiScrollOffset;  // Current vertical scroll position of the ball controls panel
+} SimulationController;
+
+// ============================================================================
+// FUNCTION PROTOTYPES
+// ============================================================================
+
+void init_simulation_controller(SimulationController *sim);
+
+void handle_input(SimulationController *sim);
+void update_physics(SimulationController *sim, float dt);
+
+void draw_simulation_area(SimulationController *sim, int simWidth, int screenHeight);
+void draw_control_panel(SimulationController *sim, int simWidth, int screenHeight, int panelWidth);
+
+void draw_panel_background(int px, int screenHeight, int panelWidth);
+void draw_ball_count_controls(SimulationController *sim, int px, int *y);
+void draw_simulation_buttons(SimulationController *sim, int px, int *y, int panelWidth);
+void draw_global_controls(SimulationController *sim, int px, int *y, int panelWidth);
+void draw_run_mode_controls(SimulationController *sim, int px, int *y, int panelWidth);
+void draw_ball_controls(SimulationController *sim, int px, int *y, int panelWidth, int screenHeight);
+void draw_energy_display(SimulationController *sim, int px, int screenHeight);
+
+void draw_mass_control(SimulationController *sim, int i, int px, int *y, int panelWidth);
+void draw_radius_control(SimulationController *sim, int i, int px, int *y, int panelWidth);
+void draw_restitution_control(SimulationController *sim, int i, int px, int *y, int panelWidth);
+void draw_velocity_mode_toggle(SimulationController *sim, int i, int px, int *y);
+void draw_speed_angle_controls(SimulationController *sim, int i, int px, int *y, int panelWidth);
+void draw_velocity_vector_controls(SimulationController *sim, int i, int px, int *y, int panelWidth);
+
+// ============================================================================
+// INITIALISATION
+// ============================================================================
+
+/**
+ * Initialises the SimulationController to sensible default values.
+ * All balls start at rest in the centre of the simulation box.
+ * Called once before the main loop begins.
+ */
+void init_simulation_controller(SimulationController *sim) {
+    sim->simState    = CONFIGURATION;
+    sim->paused      = false;
+    sim->show_vectors = true;
+    sim->slow_motion = false;
+    sim->slow_factor = 0.2f;
+
+    sim->simElapsed    = 0.0f;
+    sim->guiTimedRun   = false;
+    sim->guiRunDuration = 10.0f;
+    sim->guiScrollOffset = 0.0f;
+
+    sim->guiBallCount = 1;
+    sim->guiGravity   = GRAVITY;
+
+    for (int i = 0; i < MAX_BALLS; i++) {
+        sim->guiBalls[i].x           = WIDTH/2.0f + i*2.0f;
+        sim->guiBalls[i].y           = HEIGHT/2.0f;
+        sim->guiBalls[i].velocityx   = 0;
+        sim->guiBalls[i].velocityy   = 0;
+        sim->guiBalls[i].mass        = 1.0f;
+        sim->guiBalls[i].restitution = 0.8f;
+        sim->guiBalls[i].radius      = 0.5f;
+
+        sim->simBalls[i]        = sim->guiBalls[i];
+        sim->savedInitialBalls[i] = sim->guiBalls[i];
+
+        sim->gui_use_speedangle[i] = true;
+        sim->gui_speed[i]          = 0.0f;
+        sim->gui_angle_deg[i]      = 0.0f;
+    }
+
+    reset_trails_for_num(sim->guiBallCount);
+}
+
+// ============================================================================
+// INPUT
+// ============================================================================
+
+/**
+ * Handles keyboard shortcuts each frame:
+ *   V — toggle velocity / acceleration vector overlay
+ *   S — toggle slow-motion mode
+ *   Space — pause / resume (only while running)
+ */
+void handle_input(SimulationController *sim) {
+    if (IsKeyPressed(KEY_V))     sim->show_vectors = !sim->show_vectors;
+    if (IsKeyPressed(KEY_S))     sim->slow_motion  = !sim->slow_motion;
+    if (IsKeyPressed(KEY_SPACE) && sim->simState == RUNNING)
+        sim->paused = !sim->paused;
+}
+
+// ============================================================================
+// PHYSICS UPDATE
+// ============================================================================
+
+/**
+ * Advances the simulation by dt seconds.
+ * Does nothing if the simulation is not running or is paused.
+ *
+ * Uses 4 substeps per frame for improved collision stability —
+ * each substep integrates at sub_dt = dt/4.
+ *
+ * In slow-motion mode the effective timestep is scaled down by slow_factor.
+ *
+ * If a timed run is active, checks whether the elapsed time has
+ * reached the configured duration and resets to CONFIGURATION if so.
+ */
+void update_physics(SimulationController *sim, float dt) {
+    if (sim->simState != RUNNING || sim->paused) return;
+
+    float effective_dt = sim->slow_motion ? dt * sim->slow_factor : dt;
+
+    int   substeps = 4;
+    float sub_dt   = effective_dt / (float)substeps;
+
+    for (int s = 0; s < substeps; s++)
+        simulation_step(sim->simBalls, sim->guiBallCount, sub_dt);
+
+    if (sim->guiTimedRun) {
+        sim->simElapsed += effective_dt;
+
+        if (sim->simElapsed >= sim->guiRunDuration) {
+            sim->simState = CONFIGURATION;
+            sim->paused   = false;
+
+            for (int i = 0; i < sim->guiBallCount; i++) {
+                sim->guiBalls[i] = sim->savedInitialBalls[i];
+                sim->simBalls[i] = sim->savedInitialBalls[i];
+
+                // Restore GUI speed/angle display from saved velocities
+                sim->gui_speed[i] = sqrtf(
+                    sim->guiBalls[i].velocityx * sim->guiBalls[i].velocityx +
+                    sim->guiBalls[i].velocityy * sim->guiBalls[i].velocityy);
+                sim->gui_angle_deg[i] = atan2f(
+                    sim->guiBalls[i].velocityy,
+                    sim->guiBalls[i].velocityx) * 180.0f / (float)M_PI;
+                sim->gui_use_speedangle[i] = true;
+            }
+
+            reset_trails_for_num(sim->guiBallCount);
+            sim->simElapsed = 0.0f;
+        }
+    }
+}
+
+// ============================================================================
+// SIMULATION AREA RENDERING
+// ============================================================================
+
+/**
+ * Draws the left-hand simulation viewport:
+ *   - Light grey background with border lines.
+ *   - Trail dots for each ball (skips uninitialised positions marked -1).
+ *   - Balls as filled circles scaled to their radius.
+ *   - Optional velocity vector (blue) and gravity vector (green) overlays.
+ *
+ * In CONFIGURATION mode, guiBalls are drawn so the user can preview
+ * starting positions. In RUNNING mode, simBalls are drawn.
+ *
+ * In CONFIGURATION + speed/angle mode, the velocity vector is computed
+ * from gui_speed and gui_angle_deg rather than from velocityx/vy directly.
+ */
+void draw_simulation_area(SimulationController *sim, int simWidth, int screenHeight) {
+    float scaleX = (float)simWidth  / (float)WIDTH;
+    float scaleY = (float)screenHeight / (float)HEIGHT;
+
+    DrawRectangle(0, 0, simWidth, screenHeight, LIGHTGRAY);
+    DrawLine(0, screenHeight,   simWidth, screenHeight, BLACK);
+    DrawLine(0, 0,              0,        screenHeight, BLACK);
+    DrawLine(simWidth - 1, 0,   simWidth - 1, screenHeight, BLACK);
+
+    // Trails
+    for (int b = 0; b < sim->guiBallCount; b++) {
+        for (int t = 0; t < TRAIL_LENGTH; t++) {
+            if (trail_x[b][t] < 0) continue;
+            int px = (int)(trail_x[b][t] * scaleX);
+            int py = (int)(screenHeight - trail_y[b][t] * scaleY);
+            if (px >= 0 && px < simWidth && py >= 0 && py < screenHeight)
+                DrawCircle(px, py, 2.0f, GRAY);
+        }
+    }
+
+    // Balls and optional vector overlays
+    Ball *drawBalls = (sim->simState == RUNNING) ? sim->simBalls : sim->guiBalls;
+
+    for (int i = 0; i < sim->guiBallCount; i++) {
+        float x = drawBalls[i].x * scaleX;
+        float y = screenHeight - drawBalls[i].y * scaleY;
+        float r = drawBalls[i].radius * ((scaleX + scaleY) * 0.5f);
+
+        DrawCircle((int)x, (int)y, r, RED);
+
+        if (sim->show_vectors) {
+            float vx = drawBalls[i].velocityx;
+            float vy = drawBalls[i].velocityy;
+
+            // In config + speed/angle mode, derive velocity from GUI inputs
+            if (sim->simState == CONFIGURATION && sim->gui_use_speedangle[i]) {
+                float angle = sim->gui_angle_deg[i] * DEG2RAD;
+                vx = sim->gui_speed[i] * cosf(angle);
+                vy = sim->gui_speed[i] * sinf(angle);
+            }
+
+            // Velocity arrow (blue) — vy negated because screen Y is flipped
+            DrawLine((int)x, (int)y,
+                     (int)(x + vx * 5.0f), (int)(y - vy * 5.0f), BLUE);
+
+            // Gravity arrow (green)
+            DrawLine((int)x, (int)y,
+                     (int)x, (int)(y - sim->guiGravity * 2.0f), GREEN);
+        }
+    }
+}
+
+// ============================================================================
+// CONTROL PANEL — INDIVIDUAL BALL SLIDERS
+// ============================================================================
+
+/**
+ * Draws a labelled slider for the ball's mass with its current value shown.
+ * Advances *y by the control's height.
+ */
+void draw_mass_control(SimulationController *sim, int i, int px, int *y, int panelWidth) {
+    DrawText("Mass (kg)", px+12, *y, 12, DARKGRAY);
+
+    GuiSlider((Rectangle){px+12, *y+14, panelWidth-80, 18},
+              NULL, NULL, &sim->guiBalls[i].mass, 0.1f, 500.0f);
+
+    char buf[32];
+    sprintf(buf, "%.2f", sim->guiBalls[i].mass);
+    DrawText(buf, px+panelWidth-60, *y+14, 12, DARKGRAY);
+
+    *y += 38;
+}
+
+/**
+ * Draws a labelled slider for the ball's radius with its current value shown.
+ * Advances *y by the control's height.
+ */
+void draw_radius_control(SimulationController *sim, int i, int px, int *y, int panelWidth) {
+    DrawText("Radius (m)", px+12, *y, 12, DARKGRAY);
+
+    GuiSlider((Rectangle){px+12, *y+14, panelWidth-80, 18},
+              NULL, NULL, &sim->guiBalls[i].radius, 0.05f, 5.0f);
+
+    char buf[32];
+    sprintf(buf, "%.2f", sim->guiBalls[i].radius);
+    DrawText(buf, px+panelWidth-60, *y+14, 12, DARKGRAY);
+
+    *y += 38;
+}
+
+/**
+ * Draws a labelled slider for the ball's coefficient of restitution (0–1).
+ * Advances *y by the control's height.
+ */
+void draw_restitution_control(SimulationController *sim, int i, int px, int *y, int panelWidth) {
+    DrawText("Restitution", px+12, *y, 12, DARKGRAY);
+
+    GuiSlider((Rectangle){px+12, *y+14, panelWidth-80, 18},
+              NULL, NULL, &sim->guiBalls[i].restitution, 0.0f, 1.0f);
+
+    char buf[32];
+    sprintf(buf, "%.2f", sim->guiBalls[i].restitution);
+    DrawText(buf, px+panelWidth-60, *y+14, 12, DARKGRAY);
+
+    *y += 38;
+}
+
+/**
+ * Draws a checkbox that switches the velocity input mode between
+ * speed + angle (GCSE style) and direct vx/vy components.
+ * Advances *y by the control's height.
+ */
+void draw_velocity_mode_toggle(SimulationController *sim, int i, int px, int *y) {
+    GuiCheckBox((Rectangle){px+12, *y, 20, 20},
+                "Use Speed / Angle", &sim->gui_use_speedangle[i]);
+    *y += 26;
+}
+
+/**
+ * Draws speed and launch-angle sliders for speed/angle input mode.
+ * Converts to vx/vy on Start — these values are display-only until then.
+ * Advances *y by the combined height of both controls.
+ */
+void draw_speed_angle_controls(SimulationController *sim, int i, int px, int *y, int panelWidth) {
+    DrawText("Speed (m/s)", px+12, *y, 12, DARKGRAY);
+
+    GuiSlider((Rectangle){px+12, *y+14, panelWidth-80, 18},
+              NULL, NULL, &sim->gui_speed[i], 0.0f, 50.0f);
+
+    char buf1[32];
+    sprintf(buf1, "%.2f", sim->gui_speed[i]);
+    DrawText(buf1, px+panelWidth-60, *y+14, 12, DARKGRAY);
+    *y += 38;
+
+    DrawText("Angle (deg)", px+12, *y, 12, DARKGRAY);
+
+    GuiSlider((Rectangle){px+12, *y+14, panelWidth-80, 18},
+              NULL, NULL, &sim->gui_angle_deg[i], -180.0f, 180.0f);
+
+    char buf2[32];
+    sprintf(buf2, "%.1f", sim->gui_angle_deg[i]);
+    DrawText(buf2, px+panelWidth-60, *y+14, 12, DARKGRAY);
+    *y += 38;
+}
+
+/**
+ * Draws direct vx and vy sliders for vector component input mode.
+ * Advances *y by the combined height of both controls.
+ */
+void draw_velocity_vector_controls(SimulationController *sim, int i, int px, int *y, int panelWidth) {
+    DrawText("Velocity X (m/s)", px+12, *y, 12, DARKGRAY);
+
+    GuiSlider((Rectangle){px+12, *y+14, panelWidth-80, 18},
+              NULL, NULL, &sim->guiBalls[i].velocityx, -50.0f, 50.0f);
+
+    char buf1[32];
+    sprintf(buf1, "%.2f", sim->guiBalls[i].velocityx);
+    DrawText(buf1, px+panelWidth-60, *y+14, 12, DARKGRAY);
+    *y += 38;
+
+    DrawText("Velocity Y (m/s)", px+12, *y, 12, DARKGRAY);
+
+    GuiSlider((Rectangle){px+12, *y+14, panelWidth-80, 18},
+              NULL, NULL, &sim->guiBalls[i].velocityy, -50.0f, 50.0f);
+
+    char buf2[32];
+    sprintf(buf2, "%.2f", sim->guiBalls[i].velocityy);
+    DrawText(buf2, px+panelWidth-60, *y+14, 12, DARKGRAY);
+    *y += 38;
+}
+
+// ============================================================================
+// CONTROL PANEL — SECTIONS
+// ============================================================================
+
+/**
+ * Draws the control panel background, border, and title header.
+ */
+void draw_panel_background(int px, int screenHeight, int panelWidth) {
+    DrawRectangle(px, 0, panelWidth, screenHeight, Fade(SKYBLUE, 0.12f));
+    DrawRectangleLines(px, 0, panelWidth, screenHeight, GRAY);
+    DrawText("Controls", px + 12, 8, 20, DARKGRAY);
+}
+
+/**
+ * Draws + and - buttons to add or remove balls (CONFIGURATION only).
+ * In RUNNING mode, shows a read-only ball count label instead.
+ * Advances *y past the control.
+ */
+void draw_ball_count_controls(SimulationController *sim, int px, int *y) {
+    DrawText("Ball count", px + 12, *y, 12, DARKGRAY);
+    *y += 18;
+
+    if (sim->simState == CONFIGURATION) {
+        if (GuiButton((Rectangle){px+12, *y, 40, 24}, "-") && sim->guiBallCount > 1) {
+            sim->guiBallCount--;
+            reset_trails_for_num(sim->guiBallCount);
+        }
+
+        if (GuiButton((Rectangle){px+60, *y, 40, 24}, "+") && sim->guiBallCount < MAX_BALLS) {
+            int k = sim->guiBallCount;
+
+            sim->guiBalls[k].x           = WIDTH/2.0f + k*2.0f;
+            sim->guiBalls[k].y           = HEIGHT/2.0f;
+            sim->guiBalls[k].mass        = 1.0f;
+            sim->guiBalls[k].restitution = 0.8f;
+            sim->guiBalls[k].radius      = 0.5f;
+            sim->guiBalls[k].velocityx   = 0;
+            sim->guiBalls[k].velocityy   = 0;
+
+            sim->savedInitialBalls[k] = sim->guiBalls[k];
+            sim->gui_speed[k]         = 0;
+            sim->gui_angle_deg[k]     = 0;
+
+            sim->guiBallCount++;
+            reset_trails_for_num(sim->guiBallCount);
+        }
+
+        char buf[16];
+        sprintf(buf, "%d", sim->guiBallCount);
+        DrawText(buf, px+110, *y+2, 20, DARKGRAY);
+    }
+    else {
+        char buf[32];
+        sprintf(buf, "Balls: %d", sim->guiBallCount);
+        DrawText(buf, px+12, *y+2, 14, DARKGRAY);
+    }
+
+    *y += 34;
+}
+
+/**
+ * Draws Start / Pause / Stop controls.
+ *
+ * In CONFIGURATION mode:
+ *   - Start: converts speed/angle inputs to vx/vy, copies guiBalls to simBalls,
+ *     applies the gravity setting globally, and transitions to RUNNING.
+ *   - Pause: disabled (greyed out).
+ *   - Reset: restores guiBalls from the saved initial snapshot.
+ *
+ * In RUNNING mode:
+ *   - Start: disabled ("Running..." label).
+ *   - Pause / Resume: toggles the paused flag.
+ *   - Stop & Edit: transitions back to CONFIGURATION and restores all balls.
+ *
+ * Advances *y past all three buttons.
+ */
+void draw_simulation_buttons(SimulationController *sim, int px, int *y, int panelWidth) {
+    int btnW = panelWidth - 24;
+    int btnH = 28;
+
+    Rectangle start = {px+12, *y, btnW, btnH}; *y += btnH + 8;
+    Rectangle pause = {px+12, *y, btnW, btnH}; *y += btnH + 8;
+    Rectangle reset = {px+12, *y, btnW, btnH}; *y += btnH + 12;
+
+    if (sim->simState == CONFIGURATION) {
+        if (GuiButton(start, "Start")) {
+            for (int i = 0; i < sim->guiBallCount; i++) {
+                if (sim->gui_use_speedangle[i]) {
+                    float a = sim->gui_angle_deg[i] * (float)M_PI / 180.0f;
+                    sim->guiBalls[i].velocityx = sim->gui_speed[i] * cosf(a);
+                    sim->guiBalls[i].velocityy = sim->gui_speed[i] * sinf(a);
+                }
+                sim->simBalls[i] = sim->guiBalls[i];
+            }
+
+            GRAVITY         = sim->guiGravity;
+            sim->simState   = RUNNING;
+            sim->paused     = false;
+            reset_trails_for_num(sim->guiBallCount);
+        }
+
+        GuiSetState(STATE_DISABLED);
+        GuiButton(pause, "Pause");
+        GuiSetState(STATE_NORMAL);
+
+        if (GuiButton(reset, "Reset")) {
+            for (int i = 0; i < sim->guiBallCount; i++)
+                sim->guiBalls[i] = sim->savedInitialBalls[i];
+        }
+    }
+    else {
+        GuiSetState(STATE_DISABLED);
+        GuiButton(start, "Running...");
+        GuiSetState(STATE_NORMAL);
+
+        if (GuiButton(pause, sim->paused ? "Resume" : "Pause"))
+            sim->paused = !sim->paused;
+
+        if (GuiButton(reset, "Stop & Edit")) {
+            sim->simState = CONFIGURATION;
+            sim->paused   = false;
+            for (int i = 0; i < sim->guiBallCount; i++) {
+                sim->guiBalls[i] = sim->savedInitialBalls[i];
+                sim->simBalls[i] = sim->savedInitialBalls[i];
+            }
+        }
+    }
+}
+
+/**
+ * Draws the gravity slider (CONFIGURATION only) or a read-only gravity label
+ * (RUNNING). Advances *y past the control.
+ */
+void draw_global_controls(SimulationController *sim, int px, int *y, int panelWidth) {
+    DrawText("Global", px+12, *y, 14, DARKGRAY);
+    *y += 18;
+
+    if (sim->simState == CONFIGURATION) {
+        GuiLabel((Rectangle){px+12, *y, 60, 20}, "Gravity");
+
+        GuiSlider((Rectangle){px+70, *y, panelWidth-140, 20},
+                  NULL, NULL, &sim->guiGravity, -20.0f, 0.0f);
+
+        char buf[32];
+        sprintf(buf, "%.2f", sim->guiGravity);
+        DrawText(buf, px+panelWidth-55, *y+2, 12, DARKGRAY);
+    }
+    else {
+        char buf[64];
+        sprintf(buf, "Gravity: %.2f", GRAVITY);
+        DrawText(buf, px+12, *y, 14, DARKGRAY);
+    }
+
+    *y += 32;
+}
+
+/**
+ * Draws the timed-run checkbox and, if enabled, a duration slider.
+ * In RUNNING mode shows a read-only status label instead.
+ * Advances *y past the control.
+ */
+void draw_run_mode_controls(SimulationController *sim, int px, int *y, int panelWidth) {
+    DrawText("Run Mode", px+12, *y, 14, DARKGRAY);
+    *y += 18;
+
+    if (sim->simState == CONFIGURATION) {
+        GuiCheckBox((Rectangle){px+12, *y, 20, 20}, "Timed Run", &sim->guiTimedRun);
+        *y += 26;
+
+        if (sim->guiTimedRun) {
+            DrawText("Duration (s)", px+12, *y, 12, DARKGRAY);
+
+            GuiSlider((Rectangle){px+12, *y+14, panelWidth-24, 18},
+                      NULL, NULL, &sim->guiRunDuration, 0.5f, 600.0f);
+
+            *y += 36;
+        }
+    }
+    else {
+        char buf[64];
+        sprintf(buf, sim->guiTimedRun ? "Timed: %.1f s" : "Continuous", sim->guiRunDuration);
+        DrawText(buf, px+12, *y, 12, DARKGRAY);
+        *y += 26;
+    }
+}
+
+/**
+ * Draws a vertically scrollable list of per-ball configuration controls.
+ *
+ * Clipping:
+ *   BeginScissorMode restricts rendering to the available vertical space
+ *   below the fixed controls and above the energy bar, so controls that
+ *   scroll out of view are hidden cleanly.
+ *
+ * Scrolling:
+ *   Mouse wheel movement over the panel adjusts guiScrollOffset.
+ *   The offset is clamped between 0 and (content_h - visible_h).
+ *   A thin scrollbar on the right edge gives visual feedback.
+ *
+ * In CONFIGURATION mode, full sliders are shown for each ball.
+ * In RUNNING mode, a compact read-only velocity readout is shown instead.
+ *
+ * Advances *y to screenHeight - 40 to reserve space for the energy bar.
+ */
+void draw_ball_controls(SimulationController *sim, int px, int *y, int panelWidth, int screenHeight) {
+    int clipTop    = *y;
+    int clipHeight = screenHeight - clipTop - 40;
+
+    // Scroll on mouse wheel when cursor is over the panel
+    Vector2 mouse = GetMousePosition();
+    if (mouse.x > px) {
+        sim->guiScrollOffset -= GetMouseWheelMove() * 30.0f;
+        if (sim->guiScrollOffset < 0) sim->guiScrollOffset = 0.0f;
+    }
+
+    float content_h  = sim->guiBallCount * BALL_PANEL_HEIGHT_PER_BALL;
+    float max_scroll = content_h - clipHeight;
+    if (max_scroll < 0) max_scroll = 0;
+    if (sim->guiScrollOffset > max_scroll) sim->guiScrollOffset = max_scroll;
+
+    BeginScissorMode(px, clipTop, panelWidth, clipHeight);
+
+    int draw_y = clipTop - (int)sim->guiScrollOffset;
+
+    for (int i = 0; i < sim->guiBallCount; i++) {
+        char title[32];
+        sprintf(title, "Ball %d", i + 1);
+        DrawText(title, px+12, draw_y, 14, DARKBLUE);
+        draw_y += 20;
+
+        if (sim->simState == CONFIGURATION) {
+            draw_mass_control(sim, i, px, &draw_y, panelWidth);
+            draw_radius_control(sim, i, px, &draw_y, panelWidth);
+            draw_restitution_control(sim, i, px, &draw_y, panelWidth);
+            draw_velocity_mode_toggle(sim, i, px, &draw_y);
+
+            if (sim->gui_use_speedangle[i])
+                draw_speed_angle_controls(sim, i, px, &draw_y, panelWidth);
+            else
+                draw_velocity_vector_controls(sim, i, px, &draw_y, panelWidth);
+        }
+        else {
+            char buf[64];
+            sprintf(buf, "vx=%.1f  vy=%.1f", sim->simBalls[i].velocityx, sim->simBalls[i].velocityy);
+            DrawText(buf, px+12, draw_y, 12, DARKGRAY);
+            draw_y += 18;
+        }
+
+        draw_y += 10;
+    }
+
+    EndScissorMode();
+
+    // Scrollbar thumb
+    if (max_scroll > 0) {
+        float track_h = (float)clipHeight;
+        float thumb_h = track_h * ((float)clipHeight / content_h);
+        float thumb_y = clipTop + (sim->guiScrollOffset / max_scroll) * (track_h - thumb_h);
+
+        DrawRectangle(px + panelWidth - 6, clipTop,       5, (int)track_h, Fade(GRAY, 0.3f));
+        DrawRectangle(px + panelWidth - 6, (int)thumb_y,  5, (int)thumb_h, DARKGRAY);
+    }
+
+    *y = screenHeight - 40;
+}
+
+/**
+ * Draws the energy readout bar at the bottom of the control panel.
+ * Shows total kinetic energy, potential energy, and their sum across all balls.
+ * Uses simBalls when running and guiBalls when in configuration.
+ */
+void draw_energy_display(SimulationController *sim, int px, int screenHeight) {
+    Ball *balls = (sim->simState == RUNNING) ? sim->simBalls : sim->guiBalls;
+
+    float ke = 0, pe = 0;
+    for (int i = 0; i < sim->guiBallCount; i++) {
+        ke += kinetic_energy(&balls[i]);
+        pe += potential_energy(&balls[i]);
+    }
+
+    char buf[128];
+    sprintf(buf, "KE: %.2f J  PE: %.2f J  Total: %.2f J", ke, pe, ke + pe);
+    DrawText(buf, px+12, screenHeight-30, 12, DARKGRAY);
+}
+
+// ============================================================================
+// CONTROL PANEL — TOP LEVEL
+// ============================================================================
+
+/**
+ * Draws the full right-hand control panel by calling each section in order.
+ * Sections share a running y coordinate so they stack vertically.
+ */
+void draw_control_panel(SimulationController *sim, int simWidth, int screenHeight, int panelWidth) {
+    int px = simWidth;
+    int y  = 36;
+
+    draw_panel_background(px, screenHeight, panelWidth);
+    draw_ball_count_controls(sim, px, &y);
+    draw_simulation_buttons(sim, px, &y, panelWidth);
+    draw_global_controls(sim, px, &y, panelWidth);
+    draw_run_mode_controls(sim, px, &y, panelWidth);
+    draw_ball_controls(sim, px, &y, panelWidth, screenHeight);
+    draw_energy_display(sim, px, screenHeight);
+}
+
+// ============================================================================
+// ENTRY POINT
+// ============================================================================
+
+/**
+ * Program entry point.
+ *
+ * Sets up the window and runs the main loop:
+ *   1. Handle keyboard input.
+ *   2. Advance physics (if running and not paused).
+ *   3. Draw simulation area (left panel).
+ *   4. Draw control panel (right panel).
+ *
+ * The loop runs until the window is closed or max_frames is reached
+ * (pass 0 for max_frames to run indefinitely).
+ */
+int main(void) {
+    const int screenWidth  = 1024;
+    const int screenHeight = 720;
+    const int panelWidth   = 320;
+    const int simWidth     = screenWidth - panelWidth;
+
+    float dt = 1.0f / 60.0f;
+
+    SimulationController sim = {0};
+    init_simulation_controller(&sim);
+
+    InitWindow(screenWidth, screenHeight, "Multi-Ball Physics Simulator");
+    SetTargetFPS(60);
+
+    while (!WindowShouldClose()) {
+        handle_input(&sim);
+        update_physics(&sim, dt);
+
+        BeginDrawing();
+        ClearBackground(RAYWHITE);
+
+        draw_simulation_area(&sim, simWidth, screenHeight);
+        draw_control_panel(&sim, simWidth, screenHeight, panelWidth);
+
+        EndDrawing();
+    }
+
+    CloseWindow();
+    return 0;
+}
